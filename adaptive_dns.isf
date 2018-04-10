@@ -1,0 +1,398 @@
+type DomainName is string
+type ZoneServerAddress is string
+type IPAddress is string
+type String is string
+//-------------------------------------------------------
+type Client is session(
+	connect RootServer;
+	RootRequest(DomainName) to RootServer;
+	choice at RootServer {
+		TLDResponse(ZoneServerAddress) from RootServer;
+		disconnect RootServer;
+		rec Lookup {
+			connect ZoneServer;
+			ResolutionRequest(DomainName) to ZoneServer;
+			choice at ZoneServer {
+				PartialResolution(ZoneServerAddress) from ZoneServer;
+				disconnect ZoneServer;
+				continue Lookup;
+			} or {
+				//InvalidDomain() from ZoneServer;
+				InvalidDomain(String) from ZoneServer;
+				disconnect ZoneServer;
+			} or {
+				ResolutionComplete(IPAddress) from ZoneServer;
+				disconnect ZoneServer;
+			}
+		}
+	} or {
+		InvalidTLD(String) from RootServer;
+		disconnect RootServer;
+	}
+)
+
+type RootServer is session(
+	RootRequest(DomainName) from Client;
+	choice at RootServer {
+		TLDResponse(ZoneServerAddress) to Client;
+		disconnect Client;
+	} or {
+		//InvalidTLD() to Client;
+		InvalidTLD(String) to Client;
+		disconnect Client;
+	}
+)
+
+type ZoneServer is session(
+	rec Lookup {
+		ResolutionRequest(DomainName) from Client;
+		choice at ZoneServer {
+			PartialResolution(ZoneServerAddress) to Client;
+			disconnect Client;
+			continue Lookup;
+		} or {
+			InvalidDomain(String) to Client;
+			disconnect Client;
+		} or {
+			ResolutionComplete(IPAddress) to Client;
+			disconnect Client;
+		}
+	}
+)
+//-------------------------------------------------------
+type nameStore_element is struct(
+	string unresolvedName,
+	string resolvedName
+)
+//-------------------------------------------------------
+type choice_enum is enum(TLDResponse, PartialResolution, InvalidDomain, ResolutionComplete, InvalidTLD)
+
+//-------------------------------------------------------
+type Iclient is interface(
+	out {RootServer, string} RootServer_stringOut, 
+	in  {RootServer, string} RootServer_stringIn, 
+	out {ZoneServer, string} ZoneServer_stringOut,
+	in  {ZoneServer, string} ZoneServer_stringIn, 
+	in  {ZoneServer, choice_enum} ZoneServer_choiceIn,
+	in  {RootServer, choice_enum} RootServer_choiceIn)
+
+type IServer is interface(
+	in  {Client, string} Client_stringIn,
+	out {Client, string} Client_stringOut, 
+	out {Client, choice_enum} Client_choiceOut)
+//-------------------------------------------------------
+proc findName(String name, nameStore_element[] list) : string{
+	for i = 0 .. (list.length - 1) do{
+		if(stringEquals(name, list[i].unresolvedName)){
+			return list[i].resolvedName;
+		}
+	}
+	return "";
+}
+//-------------------------------------------------------
+proc addName(nameStore_element[] list, string unresolvedName, string resolvedName){
+	for i = 0 .. (list.length - 1) do{
+		if(stringEquals("", list[i].unresolvedName)){
+			list[i].unresolvedName := unresolvedName;
+			list[i].resolvedName   := resolvedName;
+			return;
+		}
+	}
+}
+//-------------------------------------------------------
+// update existing names, or add new one if not found
+proc updateName(nameStore_element[] list, string unresolvedName, string resolvedName){
+	for i = 0 .. (list.length - 1) do{
+		if(stringEquals(unresolvedName, list[i].unresolvedName)){
+			list[i].resolvedName   := resolvedName;
+			return;
+		}
+	}
+
+	// we got here, so not found
+	addName(list, unresolvedName, resolvedName);
+}
+//-------------------------------------------------------
+proc removeName(nameStore_element[] list, string unresolvedName){
+	for i = 0 .. (list.length - 1) do{
+		if(stringEquals(unresolvedName, list[i].unresolvedName)){
+			list[i].unresolvedName := "";
+			list[i].resolvedName   := "";
+			return;
+		}
+	}
+}
+//-------------------------------------------------------
+query alpha(){
+	1 < 2;
+}
+query find_name(string n){
+	$name == n;
+}
+//-------------------------------------------------------
+//-------------------------------------------------------
+stage home{
+
+	actor clientA presents Iclient follows Client{
+		domain_name = "nii.ac.jp";
+
+		constructor(){}
+		behaviour{
+
+			printString("Client: Find a RootServer\n");
+			root_s = findSessionActors(IServer, RootServer, find_name("jp"));
+			while(root_s.length == 0){
+				// find the root server
+				root_s := findSessionActors(IServer, RootServer, find_name("jp"));
+			}
+
+			link me with root_s[0];
+			send domain_name on RootServer_stringOut;
+			receive choice_msg from RootServer_choiceIn;
+			switch(choice_msg){
+				case TLDResponse:
+
+					receive ZoneServerAddress_msg from RootServer_stringIn;
+					unlink RootServer;
+
+					while(true) Lookup : {
+
+						printString("Client: Find a ZoneServer\n");
+						zone_s = findSessionActors(IServer, ZoneServer, find_name(ZoneServerAddress_msg));
+						while(zone_s.length == 0){
+							// find the root server
+							zone_s := findSessionActors(IServer, ZoneServer,find_name(ZoneServerAddress_msg));
+						}		
+						link me with zone_s[0];
+
+						printString("Client: ask zoneServer\n");
+						send domain_name on ZoneServer_stringOut;
+						receive choice_msg2 from ZoneServer_choiceIn;
+						printString("Client: got a choice\n");
+
+						switch(choice_msg2){
+							case PartialResolution:
+								printString("client - PartialResolution\n");
+								receive str_msg from ZoneServer_stringIn;
+								unlink ZoneServer;								
+								continue Lookup;
+							case InvalidDomain:
+								printString("client - InvalidDomain\n");
+								receive str_msg from ZoneServer_stringIn;
+								unlink ZoneServer;
+								break;
+							case ResolutionComplete:
+								printString("client - resolution complete\n");
+								receive str_msg from ZoneServer_stringIn;
+								unlink ZoneServer;
+								break Lookup;
+						}
+
+						printString("client: keep looking\n");
+					}
+				case InvalidTLD:
+					printString("client - invalid\n");
+					receive str_msg from RootServer_stringIn;
+					unlink RootServer;
+			}
+
+		}
+	}
+	//***********************************************************
+	actor RootServerA presents IServer follows RootServer{
+		list 		= new [1024]nameStore_element of nameStore_element("", "");
+		props 		= new [1]property of property("name", any(0));
+		answer 		= InvalidTLD;
+		name 		= "";
+
+		constructor(string n){
+			printString("somehow populate the list\n");
+			// set the name of this server
+
+			props[0] 	:= new property("$name", any(n));
+			name 		:= n;
+
+			addName(list, "nii.ac.jp", "ac");
+
+		}
+		behaviour{
+			publish props;
+
+			receive msg from Client_stringIn;
+
+			printString("RootServer_");
+			printString(name);
+			printString(": got msg '");
+			printString(msg);
+			printString("'\n");
+			// do we have the address of a zoneServer
+			response = findName(msg, list);
+			if(!stringEquals(response, "")){
+				answer := TLDResponse;
+			}
+			else{
+				answer := InvalidTLD;
+			}
+
+			switch(answer){
+				case TLDResponse:
+					send answer on Client_choiceOut;
+					send response on Client_stringOut;
+					unlink Client;				
+				case InvalidTLD:
+					send answer on Client_choiceOut;
+					send response on Client_stringOut;
+					unlink Client;	
+			}
+		}
+	}
+	//***********************************************************
+	actor ZoneServerA presents IServer follows ZoneServer{
+		list_ip 		= new [1024]nameStore_element of nameStore_element("", "");
+		list_server		= new [1024]nameStore_element of nameStore_element("", "");
+		selection 		= InvalidDomain;
+		props			= new [1]property of property("name", any(0));
+		name 			= "";
+
+		constructor(string n){
+			printString("somehow populate the list of servers\n");
+			printString("somehow populate the list of ips\n");
+
+			// set the name of this server
+			props[0] 	:= new property("$name", any(n));
+			name 		:= n;
+
+			addName(list_server, "nii.ac.jp", "nii");
+
+			addName(list_ip, "nii.ac.jp", "192.168.0.1");
+		}
+		behaviour{
+			publish props;
+
+			while(true)  Lookup: {
+				receive msg from Client_stringIn;
+
+				printString("ZoneServer_");
+				printString(name);
+				printString(": got msg '");
+				printString(msg);
+				printString("'\n");
+
+				// do we have the IP address
+				response = findName(msg, list_ip);
+				if(stringEquals(response, "")){
+					// do we have a closer DNS
+					response := findName(msg, list_server);
+					if(stringEquals(response, "")){
+						selection := InvalidDomain;
+					}
+					else{
+						selection := PartialResolution;
+					}
+				}
+				else{
+					selection := ResolutionComplete;
+				}
+
+				switch(selection){
+					case PartialResolution:
+						// partial Address
+						send selection on Client_choiceOut;
+						send response on Client_stringOut;
+						unlink Client;
+						continue Lookup;
+					case InvalidDomain:
+						// bad domain
+						send selection on Client_choiceOut;
+						send response on Client_stringOut;
+						unlink Client;			
+						break;
+					case ResolutionComplete:
+						// found the IP
+						send selection on Client_choiceOut;
+						send response on Client_stringOut;
+						unlink Client;
+						break;
+				}
+			}
+		}
+	}
+//***********************************************************
+	actor ZoneServerB presents IServer follows ZoneServer{
+		list_ip 		= new [1024]nameStore_element of nameStore_element("", "");
+		list_server		= new [1024]nameStore_element of nameStore_element("", "");
+		selection 		= InvalidDomain;
+		props			= new [1]property of property("name", any(0));
+		name 			= "";
+
+		constructor(string n){
+			printString("somehow populate the list of servers\n");
+			printString("somehow populate the list of ips\n");
+
+			// set the name of this server
+			props[0] 	:= new property("$name", any(n));
+			name 		:= n;
+
+			addName(list_ip, "nii.ac.jp", "192.168.0.1");
+		}
+		behaviour{
+			publish props;
+
+			while(true)  Lookup: {
+				receive msg from Client_stringIn;
+
+				printString("ZoneServer_");
+				printString(name);
+				printString(": got msg '");
+				printString(msg);
+				printString("'\n");
+
+				// do we have the IP address
+				response = findName(msg, list_ip);
+				if(stringEquals(response, "")){
+					// do we have a closer DNS
+					response := findName(msg, list_server);
+					if(stringEquals(response, "")){
+						selection := InvalidDomain;
+					}
+					else{
+						selection := PartialResolution;
+					}
+				}
+				else{
+					selection := ResolutionComplete;
+				}
+
+				switch(selection){
+					case PartialResolution:
+						// partial Address
+						send selection on Client_choiceOut;
+						send response on Client_stringOut;
+						unlink Client;
+						continue Lookup;
+					case InvalidDomain:
+						// bad domain
+						send selection on Client_choiceOut;
+						send response on Client_stringOut;
+						unlink Client;			
+						break;
+					case ResolutionComplete:
+						// found the IP
+						send selection on Client_choiceOut;
+						send response on Client_stringOut;
+						unlink Client;
+						break;
+				}
+			}
+		}
+	}
+	//***********************************************************
+	boot{
+		zone_server1 = new ZoneServerB("nii");
+		zone_server2 = new ZoneServerA("ac");
+		root_server = new RootServerA("jp");
+		
+
+		c 			= new clientA();
+	}
+}
