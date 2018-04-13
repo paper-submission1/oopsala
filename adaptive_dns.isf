@@ -179,6 +179,7 @@ stage home{
 							case InvalidDomain:
 								printString("client - InvalidDomain\n");
 								receive str_msg from ZoneServer_stringIn;
+								ZoneServerAddress_msg := str_msg;
 								unlink ZoneServer;
 								break;
 							case ResolutionComplete:
